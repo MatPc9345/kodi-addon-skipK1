@@ -6,11 +6,27 @@ import json
 import re
 import xbmc
 import xbmcaddon
+import xbmcgui
 from typing import Optional, Dict, Any, Tuple
 
 import addon_settings
 
 ADDON = xbmcaddon.Addon()
+
+def try_int(value: Any) -> Optional[int]:
+    """Loose conversion to int for infoLabel comparisons; None when not numeric."""
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return None
+
+# TMDbHelper publishes what is playing on Window(10000): its player monitor
+# resolves the played item and sets these properties, and its own play flow
+# leaves the ids of the item that was started in PlayerInfoString. Reading them
+# lets library-less playback through external players be identified without
+# touching those add-ons.
+_TMDBHELPER_WINDOW = 10000
+_TMDBHELPER_PREFIX = 'TMDbHelper.Player.'
 
 
 class TIDBPlayer(xbmc.Player):
@@ -121,7 +137,8 @@ class TIDBPlayer(xbmc.Player):
         return True
 
     def get_media_ids(self) -> Dict[str, Any]:
-        # json-rpc first (addons often set ids there), then videoinfotag
+        # library sources first (json-rpc uniqueid, videoinfotag), then what
+        # TMDbHelper publishes about the item it launched
         ids: Dict[str, Any] = {
             'imdb_id': None,
             'tmdb_id': None,
@@ -131,10 +148,15 @@ class TIDBPlayer(xbmc.Player):
             'episode': None,
             'is_movie': False,
             'duration_ms': None,
+            'year': None,
         }
 
         self._ids_from_jsonrpc(ids)
         self._ids_from_infotag(ids)
+        if not (ids.get('tmdb_id') or ids.get('tvdb_id') or ids.get('imdb_id')):
+            self._ids_from_tmdbhelper(ids)
+        if not (ids.get('tmdb_id') or ids.get('tvdb_id') or ids.get('imdb_id')):
+            self._ids_from_playerinfostring(ids)
         ids['duration_ms'] = self._get_video_duration_ms()
 
         # Which id lands on an episode depends on the scraper: some store the
@@ -479,6 +501,9 @@ class TIDBPlayer(xbmc.Player):
             })
             item = (response or {}).get('result', {}).get('item') or {}
 
+            if item.get('year'):
+                ids['year'] = try_int(item['year'])
+
             if addon_settings.setting_bool('debug_logging'):
                 xbmc.log('[TheIntroDB] JSON-RPC item: type={} uniqueid={} imdbnumber={}'.format(
                     item.get('type'), item.get('uniqueid'), item.get('imdbnumber')),
@@ -596,6 +621,14 @@ class TIDBPlayer(xbmc.Player):
             except Exception:
                 pass
 
+        if not ids.get('year'):
+            try:
+                tag_year = tag.getYear()
+                if tag_year and tag_year > 0:
+                    ids['year'] = tag_year
+            except Exception:
+                pass
+
         try:
             media_type = tag.getMediaType()
             if media_type == 'movie':
@@ -612,3 +645,146 @@ class TIDBPlayer(xbmc.Player):
                 showtitle = None
             if showtitle:
                 self._tvshow_ids_by_title(showtitle, ids, force_tmdb=True)
+
+    def _tmdbhelper_property(self, name: str) -> Optional[str]:
+        try:
+            value = xbmcgui.Window(_TMDBHELPER_WINDOW).getProperty(_TMDBHELPER_PREFIX + name)
+        except Exception:
+            return None
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
+    def _tmdbhelper_conflicts(self, ids: Dict[str, Any], season: Any, episode: Any, year: Any) -> bool:
+        """Whether property values contradict the item we are watching.
+
+        TMDbHelper keeps writing over the same properties, so old values may
+        still be around for a moment when the next item starts. Whenever the
+        property values and the item's own info are both known and disagree,
+        the property describes a different item and must be ignored.
+        """
+        if ids.get('is_movie') and (season or episode):
+            return True
+        if not ids.get('is_movie') and (ids.get('season') or ids.get('episode')):
+            if season and ids.get('season') and try_int(ids['season']) != try_int(season):
+                return True
+            if episode and ids.get('episode') and try_int(ids['episode']) != try_int(episode):
+                return True
+        if ids.get('season') and ids.get('episode') and not (season or episode):
+            # Properties came from a season-less item — only a movie item looks
+            # like this, so an episode id mix-up stays out.
+            return True
+        if year and try_int(year) and ids.get('year') and try_int(ids['year']) != try_int(year):
+            return True
+        return False
+
+    def _ids_from_tmdbhelper(self, ids: Dict[str, Any]) -> None:
+        """Take the ids TMDbHelper resolved for the item it is playing.
+
+        Its monitor looks up the played item — TVDB and TMDB ids of the show a
+        streamer episode belongs to included — and sets them on the home window
+        as TMDbHelper.Player.* properties. Episode-granularity ids ('tvdb_id',
+        'tmdb_id' on an episode) are kept apart: only the show-level ones
+        identify a title for TheIntroDB, the episode record is passed as its own
+        field so the API can use it.
+        """
+        season = self._tmdbhelper_property('season')
+        episode = self._tmdbhelper_property('episode')
+        year = self._tmdbhelper_property('year')
+
+        if self._tmdbhelper_conflicts(ids, season, episode, year):
+            if addon_settings.setting_bool('debug_logging'):
+                xbmc.log('[TheIntroDB] TMDbHelper player properties belong to another item — ignored',
+                         xbmc.LOGINFO)
+            return
+
+        if not ids.get('tvdb_id'):
+            if ids.get('is_movie'):
+                tvdb = self._extract_numeric_id(self._tmdbhelper_property('tvdb_id'))
+            else:
+                tvdb = self._extract_numeric_id(self._tmdbhelper_property('tvshow.tvdb_id'))
+            if tvdb:
+                ids['tvdb_id'] = tvdb
+        if not ids.get('tvdb_episode_id') and not ids.get('is_movie'):
+            tvdb_ep = self._extract_numeric_id(self._tmdbhelper_property('tvdb_id'))
+            if tvdb_ep and tvdb_ep != ids.get('tvdb_id'):
+                ids['tvdb_episode_id'] = tvdb_ep
+        if not ids.get('tmdb_id'):
+            if ids.get('is_movie'):
+                tmdb = self._extract_numeric_id(self._tmdbhelper_property('tmdb_id'))
+            else:
+                tmdb = self._extract_numeric_id(self._tmdbhelper_property('tvshow.tmdb_id'))
+            if tmdb:
+                ids['tmdb_id'] = tmdb
+        if not ids.get('imdb_id'):
+            if ids.get('is_movie'):
+                imdb = self._tmdbhelper_property('imdb_id')
+            else:
+                # imdb_id in this scope is the episode record; the series id lives in tvshow.imdb_id
+                imdb = self._tmdbhelper_property('tvshow.imdb_id')
+            if imdb and str(imdb).startswith('tt'):
+                ids['imdb_id'] = str(imdb)
+
+        if ids.get('season') is None and season:
+            ids['season'] = try_int(season)
+        if ids.get('episode') is None and episode:
+            ids['episode'] = try_int(episode)
+
+        if not (ids.get('tmdb_id') or ids.get('tvdb_id') or ids.get('imdb_id')):
+            return
+
+        xbmc.log('[TheIntroDB] Media ids recovered from TMDbHelper player properties', xbmc.LOGINFO)
+
+    def _ids_from_playerinfostring(self, ids: Dict[str, Any]) -> None:
+        """Reminder of the item TMDbHelper itself started playing.
+
+        Its play flow leaves a JSON with the ids of the started item in the
+        TMDbHelper.PlayerInfoString property. Only present for plays TMDbHelper
+        resolved on its own (players opening a file directly, not a folder), so
+        this stays a secondary source.
+        """
+        try:
+            raw = xbmcgui.Window(_TMDBHELPER_WINDOW).getProperty('TMDbHelper.PlayerInfoString')
+        except Exception:
+            return
+        if not raw:
+            return
+
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        prop_movie = payload.get('tmdb_type') == 'movie'
+        season = payload.get('season')
+        episode = payload.get('episode')
+
+        if self._tmdbhelper_conflicts(ids, season, episode, None):
+            if addon_settings.setting_bool('debug_logging'):
+                xbmc.log('[TheIntroDB] PlayerInfoString belongs to another item — ignored', xbmc.LOGINFO)
+            return
+
+        if not ids.get('tmdb_id'):
+            tmdb = self._extract_numeric_id(payload.get('tmdb_id'))
+            if tmdb:
+                ids['tmdb_id'] = tmdb
+        if not ids.get('imdb_id'):
+            imdb = payload.get('imdb_id')
+            if imdb and str(imdb).startswith('tt'):
+                ids['imdb_id'] = str(imdb)
+        if not ids.get('tvdb_id'):
+            tvdb = self._extract_numeric_id(payload.get('tvdb_id'))
+            if tvdb:
+                ids['tvdb_id'] = tvdb
+
+        if not prop_movie:
+            if ids.get('season') is None and season:
+                ids['season'] = try_int(season)
+            if ids.get('episode') is None and episode:
+                ids['episode'] = try_int(episode)
+
+        if ids.get('tmdb_id') or ids.get('tvdb_id') or ids.get('imdb_id'):
+            xbmc.log('[TheIntroDB] Media ids recovered from TMDbHelper PlayerInfoString', xbmc.LOGINFO)

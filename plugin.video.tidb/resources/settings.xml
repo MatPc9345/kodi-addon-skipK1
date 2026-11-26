@@ -30,7 +30,7 @@
         <setting id="hide_report_button" type="bool" label="$ADDON[plugin.video.tidb 32046]" default="false"/>
     </category>
     <category label="$ADDON[plugin.video.tidb 32029]">
-        <setting id="anonymous_usage_reporting" type="bool" label="$ADDON[plugin.video.tidb 32033]" default="true"/>
+        <setting id="anonymous_usage_reporting" type="bool" label="$ADDON[plugin.video.tidb 32033]" default="false"/>
     </category>
     <category label="$ADDON[plugin.video.tidb 32030]">
         <setting id="debug_logging" type="bool" label="$ADDON[plugin.video.tidb 32034]" default="false"/>

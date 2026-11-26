@@ -33,6 +33,11 @@ STR_SUBMIT_FAILED = 32023
 
 SUBMIT_WINDOW_SECS = 300.0  # first 5 minutes
 
+# When a streamer item carries no ids, its launcher (TMDbHelper's monitor) may
+# still be resolving them; re-extract for this many service ticks before
+# concluding the item truly has none.
+ID_LOOKUP_MAX_TICKS = 6
+
 
 class TIDBMonitor(xbmc.Monitor):
     pass
@@ -82,6 +87,7 @@ class PlaybackSession:
     submit_done_for_file: bool
     last_seen_pause_count: int
     submit_block_notified: set
+    media_ids_ticks: int
 
     def __init__(self) -> None:
         self.reset()
@@ -89,6 +95,7 @@ class PlaybackSession:
     def reset(self) -> None:
         self.current_file = None
         self.media_ids = None
+        self.media_ids_ticks = 0
         self.all_segments = None
         self.processed_segments = {}
         self.next_episode_info = None
@@ -504,6 +511,11 @@ def _run_service() -> None:
         if not filename:
             continue
 
+        # TMDbHelper resolves external players through a short dummy file first;
+        # asking the database about it only burns rate budget on a wrong match
+        if filename.endswith('dummy.mp4'):
+            continue
+
         # New file — reset everything
         if filename != session.current_file:
             session.reset()
@@ -515,14 +527,19 @@ def _run_service() -> None:
 
         _debug_osd('Monitoring: {}'.format(filename[-40:]))
 
-        # ── Fetch media IDs (cached) ──
-        if session.media_ids is None:
+        # ── Fetch media IDs (cached, retried while the launcher resolves) ──
+        no_ids = session.media_ids is not None and not any(
+            session.media_ids.get(k) for k in ('tvdb_id', 'tmdb_id', 'imdb_id'))
+        if session.media_ids is None or (no_ids and session.media_ids_ticks < ID_LOOKUP_MAX_TICKS):
+            session.media_ids_ticks += 1
             session.media_ids = player.get_media_ids()
-            xbmc.log('[TheIntroDB] Media IDs: tvdb={} tvdb_ep={} tmdb={} imdb={} S{}E{} movie={}'.format(
-                session.media_ids.get('tvdb_id'), session.media_ids.get('tvdb_episode_id'),
-                session.media_ids.get('tmdb_id'), session.media_ids.get('imdb_id'),
-                session.media_ids.get('season'), session.media_ids.get('episode'),
-                session.media_ids.get('is_movie', False)), xbmc.LOGINFO)
+            if session.media_ids_ticks == 1 or any(
+                    session.media_ids.get(k) for k in ('tvdb_id', 'tmdb_id', 'imdb_id')):
+                xbmc.log('[TheIntroDB] Media IDs: tvdb={} tvdb_ep={} tmdb={} imdb={} S{}E{} movie={}'.format(
+                    session.media_ids.get('tvdb_id'), session.media_ids.get('tvdb_episode_id'),
+                    session.media_ids.get('tmdb_id'), session.media_ids.get('imdb_id'),
+                    session.media_ids.get('season'), session.media_ids.get('episode'),
+                    session.media_ids.get('is_movie', False)), xbmc.LOGINFO)
         media_ids = session.media_ids
         tvdb = media_ids.get('tvdb_id')
         tmdb = media_ids.get('tmdb_id')
